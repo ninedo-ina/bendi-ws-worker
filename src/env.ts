@@ -7,9 +7,17 @@
  * 关联文档：docs/requirements-v3.md R4 实时通信
  * ------------------------------------------------------------
  * 说明：
- *  1. 机密（WS_AUTH_TOKEN）只通过 wrangler secret 注入，不写进 wrangler.toml；
+ *  1. 机密（WS_AUTH_TOKEN / JWT_ACCESS_SECRET / INTERNAL_TOKEN）
+ *     只通过 wrangler secret 注入，不写进 wrangler.toml；
  *  2. vars 中的数值统一以字符串传入，在此处做整数化与范围收敛；
- *  3. 鉴权默认 fail-closed：未配置 WS_AUTH_TOKEN 时拒绝全部连接。
+ *  3. 鉴权默认 fail-closed：
+ *     - WS_AUTH_TOKEN 与 JWT_ACCESS_SECRET 都未配置 → 拒绝全部连接；
+ *     - INTERNAL_TOKEN 未配置 → POST /internal/publish 返回 503。
+ *
+ * 为什么要有两套连接凭据：
+ *  JWT（主站 access token）能带出 userId，是**定向推送**的寻址依据；
+ *  静态令牌用于联调脚本（无 JWT 签发能力），userId 只能从 query 显式传入，
+ *  因此这类连接只能收房间广播，收不到按 userId 的定向推送。
  * ============================================================
  */
 
@@ -25,8 +33,12 @@ export interface HubNamespace {
 export interface Env {
   /** WebSocket 状态中枢（单例 Durable Object） */
   WS_HUB: HubNamespace;
-  /** 连接鉴权令牌（机密，来自 wrangler secret） */
+  /** 连接鉴权令牌（机密） */
   WS_AUTH_TOKEN?: string;
+  /** 主站 Access Token 验签密钥（机密，须与 node-functions 的 JWT_ACCESS_SECRET 完全一致） */
+  JWT_ACCESS_SECRET?: string;
+  /** 内部发布端点调用令牌（机密） */
+  INTERNAL_TOKEN?: string;
   /** WebSocket 路径 */
   WS_PATH?: string;
   /** 允许的来源白名单（逗号分隔） */
@@ -43,8 +55,12 @@ export interface Env {
 export interface Config {
   /** WebSocket 路径 */
   wsPath: string;
-  /** 鉴权令牌 */
+  /** 静态鉴权令牌（空串表示不启用该凭据） */
   authToken: string;
+  /** JWT 验签密钥（空串表示不启用 JWT） */
+  jwtSecret: string;
+  /** 内部端点令牌（空串表示内部端点不可用） */
+  internalToken: string;
   /** 来源白名单 */
   allowedOrigins: string[];
   /** 心跳间隔（毫秒） */
@@ -80,6 +96,8 @@ export function readConfig(env: Env): Config {
   return {
     wsPath: (env.WS_PATH || '/ws').trim() || '/ws',
     authToken: (env.WS_AUTH_TOKEN || '').trim(),
+    jwtSecret: (env.JWT_ACCESS_SECRET || '').trim(),
+    internalToken: (env.INTERNAL_TOKEN || '').trim(),
     allowedOrigins: (env.ALLOWED_ORIGINS || '*')
       .split(',')
       .map((s) => s.trim())

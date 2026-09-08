@@ -72,8 +72,34 @@ CI 配置了**路径过滤**：只有会影响线上产物的改动才触发部�
 | `HEARTBEAT_INTERVAL_MS` | var | 心跳间隔，默认 `30000` |
 | `HEARTBEAT_GRACE_MS` | var | 死亡宽限期，默认 `65000` |
 | `SESSION_TTL_MS` | var | 断线会话保留时长，默认 `60000` |
+| `JWT_ACCESS_SECRET` | **Secret** | 主站 Access Token 验签密钥（**必须与 node-functions 的 `JWT_ACCESS_SECRET` 完全一致**）；用于校验 JWT 并解析 `userId`。未配置则该凭据不启用 |
+| `INTERNAL_TOKEN` | **Secret** | 内部发布端点令牌；未配置时 `POST /internal/publish` 返回 503（fail-closed） |
 
-## 五、连接与协议
+## 五、业务事件推送（主站 → 在线用户）
+
+主站（node-functions）在消息落库 / 通知产生 / 通话信令转发后，调用：
+
+```bash
+curl -X POST https://<worker 域名>/internal/publish \
+  -H 'Content-Type: application/json' \
+  -H 'X-Internal-Token: <INTERNAL_TOKEN>' \
+  -d '{"to":["<userId1>","<userId2>"],"event":{...},"exceptClientId":"可选"}'
+```
+
+- `to`：目标用户 ID 列表，DO 内有 `userId → 会话` 反向索引，该用户的**全部在线设备**都会收到（多端同步）
+- `room`：改为房间广播（与 `to` 二选一）
+- `exceptClientId`：排除发起方自己的设备（避免自己发自己收）
+- 响应：`{"ok":true,"delivered":2}`
+- 客户端收到的是 `{"t":"event","event":{...},"ts":...}`，内容**原样透传**，Worker 不耦合业务协议
+
+客户端连上来时带上主站签发的 access token，Worker 用同一把 `JWT_ACCESS_SECRET` 验签并从 `sub` 取 userId：
+
+```
+wss://<worker 域名>/ws?token=<主站 access token>
+```
+未配置 `JWT_ACCESS_SECRET` 时只能用静态 `WS_AUTH_TOKEN` 连接，此时**收不到定向推送**（无 userId）。
+
+## 六、连接与协议
 
 ```
 wss://<worker 域名>/ws?token=<WS_AUTH_TOKEN>&clientId=<稳定的客户端标识>
@@ -87,7 +113,7 @@ wss://<worker 域名>/ws?token=<WS_AUTH_TOKEN>&clientId=<稳定的客户端标�
 
 **断线重连**：保持 `clientId` 不变，服务端在 `SESSION_TTL_MS` 内自动恢复该会话的房间订阅。
 
-## 六、健康检查与防休眠
+## 七、健康检查与防休眠
 
 ```
 GET https://<worker 域名>/health
@@ -100,7 +126,7 @@ GET https://<worker 域名>/health
 
 Workers 不像免费容器那样休眠，**不需要外部探针保活**；但保留 `/health` 便于接入监控（UptimeRobot / Better Stack 等）。
 
-## 七、容量与扩展
+## 八、容量与扩展
 
 当前用**单例 DO**（`idFromName('hub')`）承载全部连接与房间，适合中小规模：
 
@@ -108,7 +134,7 @@ Workers 不像免费容器那样休眠，**不需要外部探针保活**；但�
 - 上限：单个 DO 是单线程，消息吞吐有上限（约数千连接、每秒数千条消息量级）。
 - 扩展方向：改为「**一个房间一个 DO**」（`idFromName(room)`），广播走 DO 内部扇出，房间数不再受单 DO 限制；跨房间的会话恢复可用 Durable Object 的 `storage` 或 KV 记录 `clientId → rooms`。
 
-## 八、安全提示
+## 九、安全提示
 
 - `WS_AUTH_TOKEN` 会出现在连接 URL 上，生产建议使用**短期令牌**（由主站签发一次性票据，客户端换取后连接），避免长期令牌进入浏览器历史与日志；
 - 令牌比对使用常量时间比较（见 `src/auth.ts` 的 `safeEqual`），防止计时侧信道；

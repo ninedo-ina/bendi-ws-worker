@@ -1,7 +1,7 @@
 /**
  * ============================================================
  * 文件：apps/ws-worker/src/auth.ts
- * 描述：连接鉴权与跨域校验（Workers 版）
+ * 描述：连接鉴权与跨域校验（Workers 版，支持 JWT + 静态令牌）
  * 作者：fntp
  * 创建时间：2026-09-08
  * 关联文档：docs/security-review-v3.md
@@ -9,23 +9,33 @@
  * 与 Node 版的差异：
  *  1. Workers 运行时没有 node:crypto 的 timingSafeEqual，这里用
  *     **手写常量时间比较**（逐字符异或累加），同样避免计时侧信道；
- *  2. 浏览器 WebSocket 无法自定义请求头，因此 `?token=` 是 Web 端
- *     唯一可行的携带方式，服务端按 query → Authorization → 子协议
- *     的顺序解析。
+ *  2. 浏览器 WebSocket 无法自定义请求头，因此 `?token=` 是 Web 端唯一
+ *     可行的携带方式，服务端按 query → Authorization → 子协议解析；
+ *  3. 业务接入后新增 **JWT 校验**：直接用主站签发的 access token，
+ *     从而拿到 userId 作为定向推送的寻址依据（对齐 node-functions 的
+ *     signAccessToken：HS256 / iss=bendi / aud=bendi-client /
+ *     sub=userId / did=deviceId / typ=access）。
  * ============================================================
  */
 
-// 环境类型
-import type { Env } from './env';
+// JWT 校验（Workers 走 Web Crypto，jose 可用）
+import { jwtVerify } from 'jose';
+
+/** JWT 签发者（须与 node-functions 一致） */
+const ISSUER = 'bendi';
+/** JWT 受众（须与 node-functions 一致） */
+const AUDIENCE = 'bendi-client';
 
 /** 鉴权结果 */
-export type AuthResult = { ok: true; clientId: string } | { ok: false; code: number; reason: string };
+export type AuthResult =
+  | { ok: true; clientId: string; userId: string }
+  | { ok: false; code: number; reason: string };
 
 /**
  * 常量时间比较字符串。
  *
  * 为什么不用 `a === b`：JS 引擎的字符串比较会在首个不同字符处返回，
- * 比较耗时与「前缀匹配长度」相关，可被计时侧信道逐字符爆破令牌。
+ * 耗时与「前缀匹配长度」相关，可被计时侧信道逐字符爆破令牌。
  * 这里对全部字符做异或累加，耗时只与长度有关。
  *
  * @param a 字符串一
@@ -75,30 +85,88 @@ export function originAllowed(origin: string | null, allowed: string[]): boolean
 }
 
 /**
- * 校验 WebSocket 连接是否允许建立。
+ * 校验主站签发的 Access Token。
+ *
+ * 必须显式固定算法为 HS256（杜绝 alg=none / 算法混淆），
+ * 并校验签发者与受众，与 node-functions 的 verifyAccessToken 口径一致。
+ *
+ * @param token JWT 字符串
+ * @param secret 验签密钥（JWT_ACCESS_SECRET）
+ * @returns 解析出的用户与设备标识；无效返回 null
+ */
+export async function verifyJwt(
+  token: string,
+  secret: string,
+): Promise<{ userId: string; deviceId: string } | null> {
+  try {
+    const key = new TextEncoder().encode(secret);
+    const { payload } = await jwtVerify(token, key, {
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      algorithms: ['HS256'],
+      clockTolerance: 5,
+    });
+    // 只接受 access token（refresh token 不得用于建立连接）
+    if (payload.typ !== 'access') return null;
+    // 主体即用户 ID，缺失则拒绝
+    const userId = typeof payload.sub === 'string' ? payload.sub : '';
+    if (!userId) return null;
+    const deviceId = typeof payload.did === 'string' ? payload.did : '';
+    return { userId, deviceId };
+  } catch {
+    // 过期 / 签名不符 / 受众错误一律视为无效，不区分原因（避免信息泄漏）
+    return null;
+  }
+}
+
+/**
+ * 校验连接是否允许建立。
+ *
+ * 凭据优先级：JWT（能带出 userId，业务推送必需）→ 静态令牌（联调用）。
+ * 两者都未配置时拒绝全部连接（fail-closed）。
  *
  * @param request 原始请求
  * @param url 已解析的 URL
  * @param cfg 已解析的配置
- * @returns 鉴权结果
+ * @returns 鉴权结果（含 clientId 与 userId）
  */
-export function authorize(request: Request, url: URL, cfg: { authToken: string; allowedOrigins: string[] }): AuthResult {
+export async function authorize(
+  request: Request,
+  url: URL,
+  cfg: { authToken: string; jwtSecret: string; allowedOrigins: string[] },
+): Promise<AuthResult> {
   // 来源校验
   if (!originAllowed(request.headers.get('origin'), cfg.allowedOrigins)) {
     return { ok: false, code: 1008, reason: 'origin not allowed' };
   }
-  // 令牌校验
   const token = resolveToken(request, url);
-  if (!cfg.authToken) {
-    // 未配置令牌：fail-closed，拒绝全部连接
-    return { ok: false, code: 1008, reason: 'server auth token not configured' };
+
+  // 方式一：JWT（主站 access token）
+  if (cfg.jwtSecret && token) {
+    const claims = await verifyJwt(token, cfg.jwtSecret);
+    if (claims) {
+      // 未显式传 clientId 时按「用户 + 设备」生成，保证多端互不顶替
+      const clientId =
+        (url.searchParams.get('clientId') || '').trim().slice(0, 64) ||
+        `u_${claims.userId}_${claims.deviceId || 'web'}`;
+      return { ok: true, clientId, userId: claims.userId };
+    }
   }
-  if (!token || !safeEqual(token, cfg.authToken)) {
-    return { ok: false, code: 1008, reason: 'unauthorized' };
+
+  // 方式二：静态令牌（联调 / 内部脚本）
+  if (cfg.authToken && token && safeEqual(token, cfg.authToken)) {
+    const clientId = (url.searchParams.get('clientId') || '').trim().slice(0, 64);
+    const userId = (url.searchParams.get('userId') || '').trim().slice(0, 64);
+    return {
+      ok: true,
+      clientId: clientId || `c_${crypto.randomUUID()}`,
+      // 静态令牌带不出可信 userId，只能从 query 取（可为空 → 收不到定向推送）
+      userId,
+    };
   }
-  // 客户端标识（断线重连恢复订阅用）
-  const clientId = (url.searchParams.get('clientId') || '').trim().slice(0, 64);
-  return { ok: true, clientId };
+
+  // 无任何有效凭据
+  return { ok: false, code: 1008, reason: cfg.jwtSecret || cfg.authToken ? 'unauthorized' : 'server auth not configured' };
 }
 
 /**
@@ -118,8 +186,8 @@ export function corsHeaders(request: Request, allowed: string[]): Headers {
     headers.set('Access-Control-Allow-Origin', origin);
     headers.set('Vary', 'Origin');
   }
-  headers.set('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
-  headers.set('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  headers.set('Access-Control-Allow-Methods', 'GET,POST,HEAD,OPTIONS');
+  headers.set('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Internal-Token');
   headers.set('Access-Control-Max-Age', '86400');
   return headers;
 }

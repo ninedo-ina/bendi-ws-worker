@@ -11,6 +11,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "cf-typegen": "wrangler types"
   },
+  "dependencies": {
+    "jose": "^5.9.6"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.0.0",
     "typescript": "^5.6.3",

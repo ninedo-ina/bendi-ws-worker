@@ -7,18 +7,21 @@
  * 关联文档：docs/requirements-v3.md R4 实时通信
  * ------------------------------------------------------------
  * 为什么状态必须放在 Durable Object：
- *  Worker 本身无状态且可能在任意节点运行，连接与房间订阅这类
- *  **内存状态**只能落在 DO 里 —— 它保证同一 key 的实例全局唯一，
- *  并天然提供单线程语义（无需处理并发写 Map 的竞态）。
+ *  Worker 本身无状态且可能在任意节点运行，连接与订阅这类**内存状态**
+ *  只能落在 DO 里 —— 它保证同一 key 的实例全局唯一，并天然提供
+ *  单线程语义（无需处理并发写 Map 的竞态）。
  *
  * 心跳为什么是「应用层 ping」而不是协议帧：
  *  Workers 的 WebSocket 不支持服务端主动发送协议级 Ping 帧，
- *  因此这里用 DO 的 **alarm** 定时向每条连接发送 `{"t":"ping"}`，
+ *  因此用 DO 的 **alarm** 定时向每条连接发 `{"t":"ping"}`，
  *  客户端回 `{"t":"pong"}`（或任意消息）刷新 lastSeenAt；
  *  超过宽限期未活跃的连接由 alarm 主动关闭，促客户端重连。
  *
- * 断线重连：以 clientId 维系会话，断开后在 SESSION_TTL_MS 内
- *  用同一 clientId 重连，房间订阅自动恢复（welcome 里回传 rooms）。
+ * 业务寻址（v3.7 接入）：
+ *  除 clientId 外，每个会话还记录 **userId**（来自 JWT 的 sub）。
+ *  维护 userId → 会话集合 的反向索引，主站即可通过内部端点把
+ *  业务事件（消息 / 回执 / 撤回 / 通知 / 通话信令）**定向推送**
+ *  给指定用户的全部在线设备（多端同时收到）。
  * ============================================================
  */
 
@@ -31,6 +34,8 @@ import type { Env } from './env';
 interface Session {
   /** 会话标识 */
   clientId: string;
+  /** 所属用户（定向推送寻址用；静态令牌连接可能为空） */
+  userId: string;
   /** 当前连接（断开后为 null） */
   ws: WebSocket | null;
   /** 已加入的房间 */
@@ -49,6 +54,20 @@ interface ClientMessage {
   room?: string;
   /** 负载 */
   data?: unknown;
+  /** 业务事件（上行转发用） */
+  event?: unknown;
+}
+
+/** 内部发布请求体 */
+interface PublishRequest {
+  /** 目标用户 ID 列表（定向推送） */
+  to?: string[];
+  /** 目标房间（房间广播，与 to 二选一） */
+  room?: string;
+  /** 业务事件负载 */
+  event?: unknown;
+  /** 需要排除的会话（通常是发起方自己的设备） */
+  exceptClientId?: string;
 }
 
 /** 服务版本（与 package.json 保持一致） */
@@ -64,12 +83,13 @@ export class WsHub extends DurableObject<Env> {
   private sessions: Map<string, Session>;
   /** 房间名 → 会话 ID 集合 */
   private rooms: Map<string, Set<string>>;
+  /** userId → 会话 ID 集合（定向推送的反向索引） */
+  private userSockets: Map<string, Set<string>>;
 
   /**
    * 构造：初始化状态并安排首次心跳。
    *
-   * 环境绑定 env 由基类统一持有（this.env），子类不再重复声明，
-   * 否则会与基类的同名公开属性冲突。
+   * 环境绑定 env 由基类统一持有（this.env），子类不再重复声明。
    *
    * @param ctx DO 状态
    * @param env 环境绑定
@@ -78,6 +98,7 @@ export class WsHub extends DurableObject<Env> {
     super(ctx, env);
     this.sessions = new Map();
     this.rooms = new Map();
+    this.userSockets = new Map();
     // 首次访问时安排心跳 alarm（已有 alarm 则不重复安排）
     ctx.blockConcurrencyWhile(async () => {
       const current = await ctx.storage.getAlarm();
@@ -106,21 +127,34 @@ export class WsHub extends DurableObject<Env> {
   }
 
   /**
-   * 处理来自 Worker 的转发请求。
+   * 处理来自 Worker 的请求。
    *
-   * @param request 转发来的请求（含 x-client-id 头）
-   * @returns 101 升级响应或统计响应
+   * @param request 请求（WS 升级 / 内部发布 / 统计）
+   * @returns 响应
    */
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // 内部统计端点：供 /health 取在线数（仅内部调用）
+    // 内部统计端点：供 /health 取在线数
     if (url.pathname === '/__stats') {
       return Response.json({
         connections: this.onlineCount(),
         sessions: this.sessions.size,
         rooms: this.rooms.size,
+        users: this.userSockets.size,
       });
+    }
+
+    // 内部发布端点：主站把业务事件推给在线用户（由 Worker 校验令牌后转发）
+    if (url.pathname === '/__publish' && request.method === 'POST') {
+      let body: PublishRequest;
+      try {
+        body = (await request.json()) as PublishRequest;
+      } catch {
+        return Response.json({ error: 'invalid json' }, { status: 400 });
+      }
+      const delivered = this.deliver(body);
+      return Response.json({ delivered });
     }
 
     // 非 WebSocket 请求：拒绝
@@ -129,15 +163,15 @@ export class WsHub extends DurableObject<Env> {
       return new Response('expected websocket', { status: 426 });
     }
 
-    // 客户端标识（Worker 已鉴权，这里取用；为空则随机生成）
+    // 客户端标识与用户标识（Worker 已鉴权，这里取用）
     const clientId = request.headers.get('x-client-id') || `c_${crypto.randomUUID()}`;
+    const userId = request.headers.get('x-user-id') || '';
 
     // 建立 WebSocket 对：client 返回给浏览器，server 留在 DO 内
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    // 必须在 DO 内 accept，之后才能收发消息
-    this.handleSession(server, clientId);
+    this.handleSession(server, clientId, userId);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -146,16 +180,19 @@ export class WsHub extends DurableObject<Env> {
    *
    * @param ws 服务端侧的 WebSocket
    * @param clientId 会话标识
+   * @param userId 用户标识（可为空）
    */
-  private handleSession(ws: WebSocket, clientId: string): void {
+  private handleSession(ws: WebSocket, clientId: string, userId: string): void {
     ws.accept();
 
     // 取（或新建）会话：命中旧会话即实现重连恢复
     let session = this.sessions.get(clientId);
     if (!session) {
-      session = { clientId, ws: null, rooms: new Set<string>(), lastSeenAt: Date.now(), disconnectedAt: null };
+      session = { clientId, userId, ws: null, rooms: new Set<string>(), lastSeenAt: Date.now(), disconnectedAt: null };
       this.sessions.set(clientId, session);
     }
+    // 重连后 userId 以最新凭据为准
+    session.userId = userId;
 
     // 顶掉同一 clientId 的旧连接，避免一个会话挂多条连接导致重复收消息
     if (session.ws && session.ws !== ws) {
@@ -168,11 +205,13 @@ export class WsHub extends DurableObject<Env> {
     session.ws = ws;
     session.disconnectedAt = null;
     session.lastSeenAt = Date.now();
+    this.indexUser(session);
 
-    // 欢迎消息：回传 clientId 与已恢复的房间
+    // 欢迎消息：回传 clientId、userId 与已恢复的房间
     this.send(ws, {
       t: 'welcome',
       clientId,
+      userId,
       rooms: [...session.rooms],
       heartbeatIntervalMs: this.interval(),
     });
@@ -205,6 +244,31 @@ export class WsHub extends DurableObject<Env> {
         session.disconnectedAt = Date.now();
       }
     });
+  }
+
+  /**
+   * 维护 userId → 会话 的反向索引。
+   *
+   * @param session 会话
+   */
+  private indexUser(session: Session): void {
+    if (!session.userId) return;
+    const set = this.userSockets.get(session.userId) ?? new Set<string>();
+    set.add(session.clientId);
+    this.userSockets.set(session.userId, set);
+  }
+
+  /**
+   * 从反向索引中移除会话（房间为空时清理 key，避免 Map 无限增长）。
+   *
+   * @param session 会话
+   */
+  private unindexUser(session: Session): void {
+    if (!session.userId) return;
+    const set = this.userSockets.get(session.userId);
+    if (!set) return;
+    set.delete(session.clientId);
+    if (set.size === 0) this.userSockets.delete(session.userId);
   }
 
   /**
@@ -252,9 +316,51 @@ export class WsHub extends DurableObject<Env> {
         this.send(ws, { t: 'ack', room, delivered });
         return;
       }
+      case 'event': {
+        // 上行业务事件：转发给指定房间（不含自己）
+        if (!room) return this.send(ws, { t: 'error', message: 'room required' });
+        const delivered = this.broadcast(
+          room,
+          { t: 'event', event: msg.event ?? null, from: session.clientId, ts: Date.now() },
+          session.clientId,
+        );
+        this.send(ws, { t: 'ack', room, delivered });
+        return;
+      }
       default:
         this.send(ws, { t: 'error', message: `unknown type: ${type}` });
     }
+  }
+
+  /**
+   * 内部发布：把业务事件下发给目标用户（多端全量）或房间。
+   *
+   * @param body 发布请求
+   * @returns 送达连接数
+   */
+  private deliver(body: PublishRequest): number {
+    const payload = { t: 'event', event: body.event ?? null, ts: Date.now() };
+    // 定向推送：按 userId 找到该用户的全部在线设备
+    if (Array.isArray(body.to) && body.to.length > 0) {
+      let sent = 0;
+      for (const uid of body.to) {
+        const ids = this.userSockets.get(uid);
+        if (!ids) continue;
+        for (const cid of ids) {
+          if (cid === body.exceptClientId) continue;
+          const s = this.sessions.get(cid);
+          if (!s?.ws) continue;
+          this.send(s.ws, payload);
+          sent += 1;
+        }
+      }
+      return sent;
+    }
+    // 房间广播
+    if (body.room) {
+      return this.broadcast(body.room, payload, body.exceptClientId);
+    }
+    return 0;
   }
 
   /**
@@ -285,7 +391,7 @@ export class WsHub extends DurableObject<Env> {
   }
 
   /**
-   * 向房间广播（不含发送者自己）。
+   * 向房间广播（不含排除的会话）。
    *
    * @param room 房间名
    * @param payload 消息体
@@ -336,7 +442,7 @@ export class WsHub extends DurableObject<Env> {
    * 心跳周期（由 alarm 驱动）：
    * 1) 向每条连接发应用层 ping；
    * 2) 关闭超过宽限期未活跃的连接；
-   * 3) 清理超期未重连的会话并释放其房间订阅；
+   * 3) 清理超期未重连的会话并释放其房间与用户索引；
    * 4) 仍有会话时续订下一次 alarm（无会话则停止，省资源）。
    */
   async alarm(): Promise<void> {
@@ -366,6 +472,7 @@ export class WsHub extends DurableObject<Env> {
       const leftAt = session.disconnectedAt ?? now;
       if (now - leftAt > this.sessionTtl()) {
         for (const room of [...session.rooms]) this.leaveRoom(session, room);
+        this.unindexUser(session);
         this.sessions.delete(id);
       }
     }
