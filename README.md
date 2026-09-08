@@ -45,7 +45,24 @@ npm run deploy
 
 **注意**：`new_sqlite_classes` 迁移在首次部署时会创建 Durable Object 类，之后不要删除 `[[migrations]]` 段。
 
-## 三、环境变量 / Secrets
+## 三、自动部署的触发规则（重要）
+
+CI 配置了**路径过滤**：只有会影响线上产物的改动才触发部署，避免浪费 Cloudflare 免费额度。
+
+| 改动类型 | 是否自动部署 |
+|---|---|
+| `src/**`（服务源码） | ✅ 部署 |
+| `wrangler.toml`（配置） | ✅ 部署 |
+| `package.json` / `package-lock.json`（依赖） | ✅ 部署 |
+| `tsconfig.json` | ✅ 部署 |
+| `.github/workflows/deploy.yml` | ✅ 部署 |
+| `*.md` / `docs/**`（文档） | ❌ **不部署** |
+| `client-example.mjs`（示例脚本） | ❌ 不部署 |
+| `.gitignore` / `.dev.vars.example` / `LICENSE` | ❌ 不部署 |
+
+文档改动后如果确实需要重新部署（例如改了 README 里的说明且想同步版本号），到 GitHub **Actions → Deploy to Cloudflare Workers → Run workflow** 手动触发。
+
+## 四、环境变量 / Secrets
 
 | 名称 | 类型 | 说明 |
 |---|---|---|
@@ -56,7 +73,7 @@ npm run deploy
 | `HEARTBEAT_GRACE_MS` | var | 死亡宽限期，默认 `65000` |
 | `SESSION_TTL_MS` | var | 断线会话保留时长，默认 `60000` |
 
-## 四、连接与协议
+## 五、连接与协议
 
 ```
 wss://<worker 域名>/ws?token=<WS_AUTH_TOKEN>&clientId=<稳定的客户端标识>
@@ -70,7 +87,7 @@ wss://<worker 域名>/ws?token=<WS_AUTH_TOKEN>&clientId=<稳定的客户端标�
 
 **断线重连**：保持 `clientId` 不变，服务端在 `SESSION_TTL_MS` 内自动恢复该会话的房间订阅。
 
-## 五、健康检查与防休眠
+## 六、健康检查与防休眠
 
 ```
 GET https://<worker 域名>/health
@@ -83,7 +100,7 @@ GET https://<worker 域名>/health
 
 Workers 不像免费容器那样休眠，**不需要外部探针保活**；但保留 `/health` 便于接入监控（UptimeRobot / Better Stack 等）。
 
-## 六、容量与扩展
+## 七、容量与扩展
 
 当前用**单例 DO**（`idFromName('hub')`）承载全部连接与房间，适合中小规模：
 
@@ -91,7 +108,7 @@ Workers 不像免费容器那样休眠，**不需要外部探针保活**；但�
 - 上限：单个 DO 是单线程，消息吞吐有上限（约数千连接、每秒数千条消息量级）。
 - 扩展方向：改为「**一个房间一个 DO**」（`idFromName(room)`），广播走 DO 内部扇出，房间数不再受单 DO 限制；跨房间的会话恢复可用 Durable Object 的 `storage` 或 KV 记录 `clientId → rooms`。
 
-## 七、安全提示
+## 八、安全提示
 
 - `WS_AUTH_TOKEN` 会出现在连接 URL 上，生产建议使用**短期令牌**（由主站签发一次性票据，客户端换取后连接），避免长期令牌进入浏览器历史与日志；
 - 令牌比对使用常量时间比较（见 `src/auth.ts` 的 `safeEqual`），防止计时侧信道；

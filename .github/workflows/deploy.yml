@@ -16,7 +16,21 @@ on:
   push:
     branches:
       - main
-  # 允许在 Actions 页面手动触发
+    # ----------------------------------------------------------
+    # 触发规则：只有「会影响线上产物」的改动才部署。
+    # 文档、示例脚本、忽略配置等改动不触发 —— 避免白白消耗
+    # Cloudflare 免费额度（Workers + Durable Objects 的免费额度有限，
+    # 每次部署都会占用构建资源与请求计数）。
+    # 需要强制部署时用 Actions 页面的 Run workflow 手动触发。
+    # ----------------------------------------------------------
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.dev.vars.example'
+      - 'client-example.mjs'
+      - 'LICENSE'
+  # 允许在 Actions 页面手动触发（文档改动后如需部署走这里）
   workflow_dispatch:
 
 # 并发控制：同一分支的多次推送只保留最新一次部署
