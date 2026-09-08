@@ -1,0 +1,381 @@
+/**
+ * ============================================================
+ * 文件：apps/ws-worker/src/hub.ts
+ * 描述：WebSocket 状态中枢（Durable Object，单例）
+ * 作者：fntp
+ * 创建时间：2026-09-08
+ * 关联文档：docs/requirements-v3.md R4 实时通信
+ * ------------------------------------------------------------
+ * 为什么状态必须放在 Durable Object：
+ *  Worker 本身无状态且可能在任意节点运行，连接与房间订阅这类
+ *  **内存状态**只能落在 DO 里 —— 它保证同一 key 的实例全局唯一，
+ *  并天然提供单线程语义（无需处理并发写 Map 的竞态）。
+ *
+ * 心跳为什么是「应用层 ping」而不是协议帧：
+ *  Workers 的 WebSocket 不支持服务端主动发送协议级 Ping 帧，
+ *  因此这里用 DO 的 **alarm** 定时向每条连接发送 `{"t":"ping"}`，
+ *  客户端回 `{"t":"pong"}`（或任意消息）刷新 lastSeenAt；
+ *  超过宽限期未活跃的连接由 alarm 主动关闭，促客户端重连。
+ *
+ * 断线重连：以 clientId 维系会话，断开后在 SESSION_TTL_MS 内
+ *  用同一 clientId 重连，房间订阅自动恢复（welcome 里回传 rooms）。
+ * ============================================================
+ */
+
+// Durable Object 基类（新版 API）
+import { DurableObject } from 'cloudflare:workers';
+// 环境类型
+import type { Env } from './env';
+
+/** 会话（按 clientId 维系，支持断线重连恢复） */
+interface Session {
+  /** 会话标识 */
+  clientId: string;
+  /** 当前连接（断开后为 null） */
+  ws: WebSocket | null;
+  /** 已加入的房间 */
+  rooms: Set<string>;
+  /** 最近活跃时刻（epoch 毫秒） */
+  lastSeenAt: number;
+  /** 断开时刻（未断开为 null） */
+  disconnectedAt: number | null;
+}
+
+/** 客户端消息形状 */
+interface ClientMessage {
+  /** 消息类型 */
+  t?: string;
+  /** 房间名 */
+  room?: string;
+  /** 负载 */
+  data?: unknown;
+}
+
+/** 服务版本（与 package.json 保持一致） */
+const VERSION = '1.0.0';
+
+/**
+ * WebSocket 状态中枢。
+ *
+ * 单例运行：Worker 通过 `idFromName('hub')` 定位，保证全局唯一。
+ */
+export class WsHub extends DurableObject<Env> {
+  /** clientId → 会话 */
+  private sessions: Map<string, Session>;
+  /** 房间名 → 会话 ID 集合 */
+  private rooms: Map<string, Set<string>>;
+
+  /**
+   * 构造：初始化状态并安排首次心跳。
+   *
+   * 环境绑定 env 由基类统一持有（this.env），子类不再重复声明，
+   * 否则会与基类的同名公开属性冲突。
+   *
+   * @param ctx DO 状态
+   * @param env 环境绑定
+   */
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sessions = new Map();
+    this.rooms = new Map();
+    // 首次访问时安排心跳 alarm（已有 alarm 则不重复安排）
+    ctx.blockConcurrencyWhile(async () => {
+      const current = await ctx.storage.getAlarm();
+      if (current === null) {
+        await ctx.storage.setAlarm(Date.now() + this.interval());
+      }
+    });
+  }
+
+  /** 心跳间隔（毫秒） */
+  private interval(): number {
+    const raw = Number(this.env.HEARTBEAT_INTERVAL_MS);
+    return Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
+  }
+
+  /** 死亡宽限期（毫秒） */
+  private grace(): number {
+    const raw = Number(this.env.HEARTBEAT_GRACE_MS);
+    return Number.isFinite(raw) && raw >= 10_000 ? raw : 65_000;
+  }
+
+  /** 会话保留时长（毫秒） */
+  private sessionTtl(): number {
+    const raw = Number(this.env.SESSION_TTL_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+  }
+
+  /**
+   * 处理来自 Worker 的转发请求。
+   *
+   * @param request 转发来的请求（含 x-client-id 头）
+   * @returns 101 升级响应或统计响应
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // 内部统计端点：供 /health 取在线数（仅内部调用）
+    if (url.pathname === '/__stats') {
+      return Response.json({
+        connections: this.onlineCount(),
+        sessions: this.sessions.size,
+        rooms: this.rooms.size,
+      });
+    }
+
+    // 非 WebSocket 请求：拒绝
+    const upgrade = request.headers.get('upgrade');
+    if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
+      return new Response('expected websocket', { status: 426 });
+    }
+
+    // 客户端标识（Worker 已鉴权，这里取用；为空则随机生成）
+    const clientId = request.headers.get('x-client-id') || `c_${crypto.randomUUID()}`;
+
+    // 建立 WebSocket 对：client 返回给浏览器，server 留在 DO 内
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    // 必须在 DO 内 accept，之后才能收发消息
+    this.handleSession(server, clientId);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * 绑定并接管一条连接。
+   *
+   * @param ws 服务端侧的 WebSocket
+   * @param clientId 会话标识
+   */
+  private handleSession(ws: WebSocket, clientId: string): void {
+    ws.accept();
+
+    // 取（或新建）会话：命中旧会话即实现重连恢复
+    let session = this.sessions.get(clientId);
+    if (!session) {
+      session = { clientId, ws: null, rooms: new Set<string>(), lastSeenAt: Date.now(), disconnectedAt: null };
+      this.sessions.set(clientId, session);
+    }
+
+    // 顶掉同一 clientId 的旧连接，避免一个会话挂多条连接导致重复收消息
+    if (session.ws && session.ws !== ws) {
+      try {
+        session.ws.close(4002, 'replaced by new connection');
+      } catch {
+        // 旧连接可能已处于关闭中，忽略
+      }
+    }
+    session.ws = ws;
+    session.disconnectedAt = null;
+    session.lastSeenAt = Date.now();
+
+    // 欢迎消息：回传 clientId 与已恢复的房间
+    this.send(ws, {
+      t: 'welcome',
+      clientId,
+      rooms: [...session.rooms],
+      heartbeatIntervalMs: this.interval(),
+    });
+
+    // 收到消息
+    ws.addEventListener('message', (event: MessageEvent) => {
+      session.lastSeenAt = Date.now();
+      // 二进制消息不处理（本服务只走 JSON 文本）
+      if (typeof event.data !== 'string') return;
+      this.onMessage(ws, session, event.data);
+    });
+
+    // 连接关闭：保留会话（供短时重连恢复）
+    ws.addEventListener('close', () => {
+      if (session.ws === ws) {
+        session.ws = null;
+        session.disconnectedAt = Date.now();
+      }
+    });
+
+    // 连接异常：直接清理，避免半死连接占用会话
+    ws.addEventListener('error', () => {
+      try {
+        ws.close(4000, 'connection error');
+      } catch {
+        // 已关闭则忽略
+      }
+      if (session.ws === ws) {
+        session.ws = null;
+        session.disconnectedAt = Date.now();
+      }
+    });
+  }
+
+  /**
+   * 处理一条客户端消息。
+   *
+   * @param ws 来源连接
+   * @param session 所属会话
+   * @param raw 原始文本
+   */
+  private onMessage(ws: WebSocket, session: Session, raw: string): void {
+    let msg: ClientMessage;
+    try {
+      msg = JSON.parse(raw) as ClientMessage;
+    } catch {
+      this.send(ws, { t: 'error', message: 'invalid json' });
+      return;
+    }
+    const type = msg.t || '';
+    const room = typeof msg.room === 'string' ? msg.room.trim().slice(0, 64) : '';
+
+    switch (type) {
+      case 'pong':
+        // 应用层心跳回应：lastSeenAt 已在外层刷新，无需额外处理
+        return;
+      case 'ping':
+        this.send(ws, { t: 'pong', ts: Date.now() });
+        return;
+      case 'join':
+        if (!room) return this.send(ws, { t: 'error', message: 'room required' });
+        this.joinRoom(session, room);
+        this.send(ws, { t: 'joined', room });
+        return;
+      case 'leave':
+        if (!room) return this.send(ws, { t: 'error', message: 'room required' });
+        this.leaveRoom(session, room);
+        this.send(ws, { t: 'left', room });
+        return;
+      case 'publish': {
+        if (!room) return this.send(ws, { t: 'error', message: 'room required' });
+        const delivered = this.broadcast(
+          room,
+          { t: 'message', room, data: msg.data ?? null, from: session.clientId, ts: Date.now() },
+          session.clientId,
+        );
+        this.send(ws, { t: 'ack', room, delivered });
+        return;
+      }
+      default:
+        this.send(ws, { t: 'error', message: `unknown type: ${type}` });
+    }
+  }
+
+  /**
+   * 加入房间（幂等）。
+   *
+   * @param session 会话
+   * @param room 房间名
+   */
+  private joinRoom(session: Session, room: string): void {
+    session.rooms.add(room);
+    const set = this.rooms.get(room) ?? new Set<string>();
+    set.add(session.clientId);
+    this.rooms.set(room, set);
+  }
+
+  /**
+   * 离开房间（房间空了则清理索引）。
+   *
+   * @param session 会话
+   * @param room 房间名
+   */
+  private leaveRoom(session: Session, room: string): void {
+    session.rooms.delete(room);
+    const set = this.rooms.get(room);
+    if (!set) return;
+    set.delete(session.clientId);
+    if (set.size === 0) this.rooms.delete(room);
+  }
+
+  /**
+   * 向房间广播（不含发送者自己）。
+   *
+   * @param room 房间名
+   * @param payload 消息体
+   * @param exceptClientId 排除的会话
+   * @returns 送达连接数
+   */
+  private broadcast(room: string, payload: unknown, exceptClientId?: string): number {
+    const set = this.rooms.get(room);
+    if (!set || set.size === 0) return 0;
+    const data = JSON.stringify(payload);
+    let sent = 0;
+    for (const id of set) {
+      if (id === exceptClientId) continue;
+      const s = this.sessions.get(id);
+      if (!s?.ws) continue;
+      try {
+        s.ws.send(data);
+        sent += 1;
+      } catch {
+        // 发送失败（连接已半死）：交给 alarm 清理
+      }
+    }
+    return sent;
+  }
+
+  /** 当前在线连接数 */
+  private onlineCount(): number {
+    let n = 0;
+    for (const s of this.sessions.values()) if (s.ws) n += 1;
+    return n;
+  }
+
+  /**
+   * 发送 JSON 消息（连接已关闭时静默失败）。
+   *
+   * @param ws 目标连接
+   * @param payload 消息体
+   */
+  private send(ws: WebSocket, payload: unknown): void {
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch {
+      // 连接已断开：忽略（alarm 会清理）
+    }
+  }
+
+  /**
+   * 心跳周期（由 alarm 驱动）：
+   * 1) 向每条连接发应用层 ping；
+   * 2) 关闭超过宽限期未活跃的连接；
+   * 3) 清理超期未重连的会话并释放其房间订阅；
+   * 4) 仍有会话时续订下一次 alarm（无会话则停止，省资源）。
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+
+    for (const session of this.sessions.values()) {
+      const ws = session.ws;
+      if (!ws) continue;
+      // 超过宽限期未活跃：判定死亡，主动关闭以触发客户端重连
+      if (now - session.lastSeenAt > this.grace()) {
+        try {
+          ws.close(4000, 'heartbeat timeout');
+        } catch {
+          // 已关闭则忽略
+        }
+        session.ws = null;
+        session.disconnectedAt = now;
+        continue;
+      }
+      // 正常连接：发应用层 ping
+      this.send(ws, { t: 'ping', ts: now });
+    }
+
+    // 清理超期未重连的会话
+    for (const [id, session] of this.sessions) {
+      if (session.ws) continue;
+      const leftAt = session.disconnectedAt ?? now;
+      if (now - leftAt > this.sessionTtl()) {
+        for (const room of [...session.rooms]) this.leaveRoom(session, room);
+        this.sessions.delete(id);
+      }
+    }
+
+    // 仍有会话则续订 alarm；全部清空则停止，下次有新连接时再启动
+    if (this.sessions.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + this.interval());
+    }
+  }
+}
+
+/** 供外部（README / 文档）参考的版本常量 */
+export const HUB_VERSION = VERSION;

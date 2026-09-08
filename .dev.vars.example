@@ -1,0 +1,10 @@
+# 本地开发机密（复制为 .dev.vars 后填写；.dev.vars 已在 .gitignore 中，切勿提交）
+# 连接鉴权令牌：未配置时服务拒绝全部连接（fail-closed）
+WS_AUTH_TOKEN=dev-token-change-me
+
+# 可选的本地覆盖（不填则用 wrangler.toml 的 vars）
+# WS_PATH=/ws
+# ALLOWED_ORIGINS=*
+# HEARTBEAT_INTERVAL_MS=30000
+# HEARTBEAT_GRACE_MS=65000
+# SESSION_TTL_MS=60000

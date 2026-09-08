@@ -1,0 +1,49 @@
+# ============================================================
+# Wrangler 配置 —— bendi-ws-worker（Cloudflare Workers + Durable Objects）
+# 文档：https://developers.cloudflare.com/workers/wrangler/configuration/
+# ------------------------------------------------------------
+# 说明：
+#  1. WebSocket 状态由 Durable Object（WsHub 单例）承载，
+#     Worker 本身无状态，可全球任意节点运行；
+#  2. WS_AUTH_TOKEN 属于机密，禁止写进本文件 —— 用
+#       npx wrangler secret put WS_AUTH_TOKEN
+#     注入（本地调试写 .dev.vars，该文件已在 .gitignore 中）；
+#  3. 未配置 WS_AUTH_TOKEN 时服务拒绝全部连接（fail-closed）。
+# ============================================================
+
+name = "bendi-ws-worker"
+main = "src/index.ts"
+compatibility_date = "2026-09-08"
+
+# 可观测性：开启后可在 Cloudflare 控制台查看请求与日志
+[observability]
+enabled = true
+
+# ---------- 非机密配置 ----------
+[vars]
+# WebSocket 挂载路径
+WS_PATH = "/ws"
+# 允许的来源白名单（逗号分隔；'*' 表示不限制）
+ALLOWED_ORIGINS = "*"
+# 应用层心跳间隔（毫秒）：Durable Object 按此周期发 ping 并清理死连接
+HEARTBEAT_INTERVAL_MS = "30000"
+# 判定连接死亡的宽限期（毫秒）
+HEARTBEAT_GRACE_MS = "65000"
+# 断线后会话保留时长（毫秒）：期间重连可恢复房间订阅
+SESSION_TTL_MS = "60000"
+
+# ---------- Durable Object 绑定 ----------
+[[durable_objects.bindings]]
+name = "WS_HUB"
+class_name = "WsHub"
+
+# ---------- 迁移声明（首次部署必须） ----------
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WsHub"]
+
+# ---------- 生产环境（可选） ----------
+# 如需自定义域名，取消注释并填入你的域名（需已在 Cloudflare 托管）
+# [[env.production.routes]]
+# pattern = "ws.example.com/*"
+# zone_name = "example.com"

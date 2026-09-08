@@ -1,0 +1,68 @@
+# ============================================================
+# GitHub Actions —— 推送到 main 自动部署到 Cloudflare Workers
+# ------------------------------------------------------------
+# 需要的仓库 Secrets（Settings → Secrets and variables → Actions）：
+#   CLOUDFLARE_API_TOKEN   Cloudflare API Token（Workers 编辑权限）
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare Account ID
+#   WS_AUTH_TOKEN          WebSocket 连接鉴权令牌（会写入 Worker 的 Secret）
+#
+# 说明：WS_AUTH_TOKEN 每次部署都会重新下发，值与仓库 Secret 保持一致；
+#       未配置时服务会拒绝全部连接（fail-closed）。
+# ============================================================
+name: Deploy to Cloudflare Workers
+
+on:
+  # 主分支推送即部署
+  push:
+    branches:
+      - main
+  # 允许在 Actions 页面手动触发
+  workflow_dispatch:
+
+# 并发控制：同一分支的多次推送只保留最新一次部署
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 类型检查
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: 部署到 Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 下发机密（与 Worker 的 secret 保持一致）
+          secrets: |
+            WS_AUTH_TOKEN
+
+      - name: 健康检查
+        run: |
+          URL="https://bendi-ws-worker.gongyizhan-2026.workers.dev/health"
+          echo "检查 $URL"
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            echo "第 $i 次：$code"
+            if [ "$code" = "200" ]; then
+              echo "健康检查通过"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "健康检查未通过"
+          exit 1

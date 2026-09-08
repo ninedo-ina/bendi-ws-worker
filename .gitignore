@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+
+# 本地机密（wrangler secret 用，切勿提交）
+.dev.vars
