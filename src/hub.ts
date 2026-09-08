@@ -293,6 +293,11 @@ export class WsHub extends DurableObject<Env> {
       case 'pong':
         // 应用层心跳回应：lastSeenAt 已在外层刷新，无需额外处理
         return;
+      case 'auth':
+        // 兼容旧客户端：连接时（?token= 已鉴权）仍会补发一帧 auth。
+        // 若不回 auth.ok，前端会一直停留在 connecting，兜底轮询永不停止。
+        this.send(ws, { t: 'auth.ok', clientId: session.clientId, userId: session.userId });
+        return;
       case 'ping':
         this.send(ws, { t: 'pong', ts: Date.now() });
         return;
