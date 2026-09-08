@@ -120,6 +120,35 @@ export async function verifyJwt(
 }
 
 /**
+ * 校验主站签发的**服务票据**（typ='service'）。
+ *
+ * 用途：主站（node-functions）调用内部发布端点时的凭据。
+ * 之所以复用 JWT_ACCESS_SECRET 而不是再配一把共享密钥：
+ *  少一个需要同步维护的机密，且这把密钥主站本来就有。
+ * 票据只认 typ='service'，与登录用的 typ='access' 严格区分，
+ * 即便用户拿到自己的 access token 也调不通内部端点。
+ *
+ * @param token JWT 字符串
+ * @param secret 验签密钥（JWT_ACCESS_SECRET）
+ * @returns 是否为有效的服务票据
+ */
+export async function verifyServiceToken(token: string, secret: string): Promise<boolean> {
+  try {
+    const key = new TextEncoder().encode(secret);
+    const { payload } = await jwtVerify(token, key, {
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      algorithms: ['HS256'],
+      clockTolerance: 5,
+    });
+    // 仅接受服务票据
+    return payload.typ === 'service';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 校验连接是否允许建立。
  *
  * 凭据优先级：JWT（能带出 userId，业务推送必需）→ 静态令牌（联调用）。

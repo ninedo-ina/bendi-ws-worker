@@ -23,7 +23,7 @@
 
 // 配置与鉴权
 import { readConfig, type Env } from './env';
-import { authorize, corsHeaders, safeEqual } from './auth';
+import { authorize, corsHeaders, safeEqual, verifyServiceToken } from './auth';
 // Durable Object 导出（wrangler 需要在此处导出类）
 export { WsHub } from './hub';
 
@@ -123,8 +123,21 @@ export default {
       if (!cfg.internalToken) {
         return json({ error: 'internal endpoint not configured' }, cors, 503);
       }
+      // 凭据一：静态内部令牌（X-Internal-Token）
       const provided = request.headers.get('x-internal-token') || '';
-      if (!provided || !safeEqual(provided, cfg.internalToken)) {
+      const okByToken = Boolean(provided) && Boolean(cfg.internalToken) && safeEqual(provided, cfg.internalToken);
+
+      // 凭据二：主站用 JWT_ACCESS_SECRET 签发的服务票据（typ='service'）。
+      // 这样主站不必再维护一把共享密钥；票据 60 秒过期，泄露影响面可控。
+      let okByServiceJwt = false;
+      if (!okByToken && cfg.jwtSecret) {
+        const auth = request.headers.get('authorization');
+        if (auth && auth.toLowerCase().startsWith('bearer ')) {
+          okByServiceJwt = await verifyServiceToken(auth.slice(7).trim(), cfg.jwtSecret);
+        }
+      }
+
+      if (!okByToken && !okByServiceJwt) {
         return json({ error: 'unauthorized' }, cors, 401);
       }
       // 读取并转发给 DO（不解析 event 内容，保持透传，Worker 不耦合业务协议）
