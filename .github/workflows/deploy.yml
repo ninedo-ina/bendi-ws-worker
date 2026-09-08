@@ -34,7 +34,7 @@ jobs:
       - name: 准备 Node 环境
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: 安装依赖
         run: npm install
@@ -44,6 +44,10 @@ jobs:
 
       - name: 部署到 Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
+        # 关键：wrangler-action 的 secrets 输入是从**环境变量**取值的，
+        # 必须显式注入 env，否则会报 "Value for secret ... not found in environment"
+        env:
+          WS_AUTH_TOKEN: ${{ secrets.WS_AUTH_TOKEN }}
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
